@@ -32,6 +32,15 @@ export default function manifestFromObject(o: Record<string, unknown>): PluginMa
 		return o[name] as boolean;
 	};
 
+	const getPluginApiVersion = (): string|undefined => {
+		if (o.plugin_api_version === undefined) return undefined;
+		if (typeof o.plugin_api_version !== 'string') throw new Error('Field must be a string: plugin_api_version');
+		if (!/^[0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z.-]+)?$/.test(o.plugin_api_version)) {
+			throw new Error(`Invalid plugin API version: ${o.plugin_api_version}`);
+		}
+		return o.plugin_api_version;
+	};
+
 	const getScreenshots = (defaultValue: Image[] = []): Image[] => {
 		if (!o.screenshots) return defaultValue;
 		return o.screenshots as Image[];
@@ -59,6 +68,7 @@ export default function manifestFromObject(o: Record<string, unknown>): PluginMa
 		version: getString('version', true),
 		app_min_version: getString('app_min_version', true),
 		app_min_version_mobile: getString('app_min_version', false),
+		plugin_api_version: getPluginApiVersion(),
 		platforms: getStrings('platforms', false),
 
 		author: getString('author', false),

@@ -15,6 +15,11 @@ import { AppType } from './api/types';
 import minVersionForPlatform from './utils/isCompatible/minVersionForPlatform';
 import { _ } from '../../locale';
 import ViewController from './ViewController';
+import {
+	describePluginApiIncompatibility,
+	getPluginApiCompatibility,
+	PluginApiCompatibilityStatus,
+} from './utils/pluginApiCompatibility';
 const uslug = require('@joplin/fork-uslug');
 
 const logger = Logger.create('PluginService');
@@ -584,7 +589,9 @@ export default class PluginService extends BaseService {
 	}
 
 	public isCompatible(manifest: PluginManifest): boolean {
-		return isCompatible(this.appVersion_, this.appType_, manifest);
+		const appCompatible = isCompatible(this.appVersion_, this.appType_, manifest);
+		const apiCompatibility = getPluginApiCompatibility(this.appVersion_, manifest);
+		return appCompatible && apiCompatibility.status !== PluginApiCompatibilityStatus.Unsupported;
 	}
 
 	private validateManifest(manifest: unknown): void {
@@ -601,6 +608,10 @@ export default class PluginService extends BaseService {
 		}
 
 		if (this.isCompatible(manifest)) return null;
+
+		const apiCompatibility = getPluginApiCompatibility(this.appVersion_, manifest);
+		const apiDescription = describePluginApiIncompatibility(apiCompatibility);
+		if (apiDescription) return apiDescription;
 
 		const minVersion = minVersionForPlatform(this.appType_, manifest);
 		if (minVersion) {
@@ -627,8 +638,23 @@ export default class PluginService extends BaseService {
 		if (this.isSafeMode) throw new Error(`Plugin was not started due to safe mode: ${plugin.manifest.id}`);
 
 		if (!this.isCompatible(plugin.manifest)) {
-			throw new Error(`Plugin "${plugin.id}" was disabled: ${this.describeIncompatibility(plugin.manifest)}`);
+			const incompatibility = this.describeIncompatibility(plugin.manifest);
+			const apiCompatibility = getPluginApiCompatibility(this.appVersion_, plugin.manifest);
+			if (apiCompatibility.status === PluginApiCompatibilityStatus.Unsupported) {
+				logger.warn(
+					`Plugin "${plugin.manifest.name}" (${plugin.id}) was disabled: ${incompatibility}`,
+				);
+			}
+			throw new Error(`Plugin "${plugin.id}" was disabled: ${incompatibility}`);
 		} else {
+			const apiCompatibility = getPluginApiCompatibility(this.appVersion_, plugin.manifest);
+			if (apiCompatibility.status === PluginApiCompatibilityStatus.Deprecated) {
+				plugin.deprecationNotice(
+					'Next major Plugin API version',
+					`Plugin "${plugin.id}" requires deprecated Plugin API version ${apiCompatibility.requiredVersion}.`,
+					false,
+				);
+			}
 			this.store_.dispatch({
 				type: 'PLUGIN_ADD',
 				plugin: {

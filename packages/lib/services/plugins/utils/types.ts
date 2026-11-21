@@ -21,6 +21,7 @@ export interface PluginManifest {
 	version: string;
 	app_min_version: string;
 	app_min_version_mobile?: string;
+	plugin_api_version?: string;
 	platforms?: string[];
 	author?: string;
 	description?: string;
