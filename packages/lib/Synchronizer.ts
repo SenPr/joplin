@@ -21,8 +21,8 @@ import NoteLockNote from './services/noteLock/NoteLockNote';
 import EncryptionService from './services/e2ee/EncryptionService';
 import JoplinError from './JoplinError';
 import ShareService from './services/share/ShareService';
-import TaskQueue from './TaskQueue';
 import ItemUploader from './services/synchronizer/ItemUploader';
+import RemoteItemDownloader from './services/synchronizer/RemoteItemDownloader';
 import { FileApi, getSupportsDeltaWithItems, isLocalServer, PaginatedList, RemoteItem, enableEnhancedBasicDeltaAlgorithm } from './file-api';
 import JoplinDatabase from './JoplinDatabase';
 import { checkIfCanSync, fetchSyncInfo, checkSyncTargetIsValid, getActiveMasterKey, localSyncInfo, mergeSyncInfos, saveLocalSyncInfo, setMasterKeyHasBeenUsed, SyncInfo, syncInfoEquals, uploadSyncInfo } from './services/synchronizer/syncInfoUtils';
@@ -94,7 +94,7 @@ export default class Synchronizer {
 	private state_ = 'idle';
 	private cancelling_ = false;
 	public maxResourceSize_: number = null;
-	private downloadQueue_: TaskQueue = null;
+	private remoteItemDownloader_: RemoteItemDownloader = null;
 	private clientId_: string;
 	private lockHandler_: LockHandler;
 	private migrationHandler_: MigrationHandler;
@@ -309,7 +309,7 @@ export default class Synchronizer {
 
 		// Stop queue but don't set it to null as it may be used to
 		// retrieve the last few downloads.
-		if (this.downloadQueue_) void this.downloadQueue_.stop();
+		if (this.remoteItemDownloader_) void this.remoteItemDownloader_.stop();
 
 		this.logSyncOperation('cancelling', null, null, '');
 		this.cancelling_ = true;
@@ -894,8 +894,8 @@ export default class Synchronizer {
 			// have been created or updated, and apply the changes to local.
 			// ------------------------------------------------------------------------
 
-			if (this.downloadQueue_) await this.downloadQueue_.stop();
-			this.downloadQueue_ = new TaskQueue('syncDownload', logger);
+			if (this.remoteItemDownloader_) await this.remoteItemDownloader_.stop();
+			this.remoteItemDownloader_ = new RemoteItemDownloader(this.apiCall, logger);
 
 			if (syncSteps.indexOf('delta') >= 0) {
 				// At this point all the local items that have changed have been pushed to remote
@@ -952,25 +952,13 @@ export default class Synchronizer {
 					const remoteIds = remotes.map(r => BaseItem.pathToId(r.path));
 					const locals = await BaseItem.loadItemsByIds(remoteIds);
 
-					for (const remote of remotes) {
-						if (this.cancelling()) break;
-
-						let needsToDownload = true;
-						if (this.api().supportsAccurateTimestamp) {
-							const local = locals.find(l => l.id === BaseItem.pathToId(remote.path));
-							if (local && local.updated_time === remote.jop_updated_time) needsToDownload = false;
-						}
-
-						if (supportsDeltaWithItems) {
-							needsToDownload = false;
-						}
-
-						if (needsToDownload) {
-							this.downloadQueue_.push(remote.path, async () => {
-								return this.apiCall('get', remote.path);
-							});
-						}
-					}
+					this.remoteItemDownloader_.queueDownloads(
+						remotes,
+						locals,
+						supportsDeltaWithItems,
+						this.api().supportsAccurateTimestamp,
+						() => this.cancelling(),
+					);
 
 					for (let i = 0; i < remotes.length; i++) {
 						if (this.cancelling() || this.testingHooks_.indexOf('cancelDeltaLoop2') >= 0) {
@@ -982,15 +970,6 @@ export default class Synchronizer {
 
 						const remote = remotes[i];
 						if (!BaseItem.isSystemPath(remote.path)) continue; // The delta API might return things like the .sync, .resource or the root folder
-
-						const loadContent = async () => {
-							if (supportsDeltaWithItems) return remote.jopItem;
-
-							const task = await this.downloadQueue_.waitForResult(path);
-							if (task.error) throw task.error;
-							if (!task.result) return null;
-							return await BaseItem.unserialize(task.result as string);
-						};
 
 						const path = remote.path;
 						const remoteId = BaseItem.pathToId(path);
@@ -1005,7 +984,7 @@ export default class Synchronizer {
 								if (remote.isDeleted !== true) {
 									action = SyncAction.CreateLocal;
 									reason = 'remote exists but local does not';
-									content = await loadContent();
+									content = await this.remoteItemDownloader_.loadContent(remote, supportsDeltaWithItems);
 									ItemClass = content ? BaseItem.itemClass(content) : null;
 								} else {
 									reason = 'skipping: the item was deleted';
@@ -1025,7 +1004,7 @@ export default class Synchronizer {
 									if (this.api().supportsAccurateTimestamp && remote.jop_updated_time === local.updated_time) {
 										// Nothing to do, and no need to fetch the content
 									} else {
-										content = await loadContent();
+										content = await this.remoteItemDownloader_.loadContent(remote, supportsDeltaWithItems);
 										// Load the latest updated_time, otherwise a change made during a long delta step could overwrite the local version without making a conflict
 										const latestLocalState = await ItemClass.load(remoteId, { fields: ['updated_time'] });
 										const localUpdatedTime = latestLocalState ? latestLocalState.updated_time : local.updated_time;
