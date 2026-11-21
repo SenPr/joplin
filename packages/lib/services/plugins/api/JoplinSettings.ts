@@ -201,6 +201,11 @@ export default class JoplinSettings {
 	 */
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Plugin API: setting values are heterogeneous; plugin authors narrow at use site
 	public async globalValue(key: string): Promise<any> {
+		this.plugin_.deprecationNotice(
+			'1.9',
+			'joplin.settings.globalValue() is deprecated in favour of joplin.settings.globalValues()',
+			false,
+		);
 		if (Setting.isSecureKey(key)) return undefined;
 		return Setting.value(key);
 	}
