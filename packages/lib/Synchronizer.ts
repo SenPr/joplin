@@ -29,6 +29,8 @@ import { checkIfCanSync, fetchSyncInfo, checkSyncTargetIsValid, getActiveMasterK
 import { getMasterPassword, setupAndDisableEncryption, setupAndEnableEncryption } from './services/e2ee/utils';
 import { generateKeyPair } from './services/e2ee/ppk/ppk';
 import syncDebugLog from './services/synchronizer/syncDebugLog';
+import { runSyncModule, SyncModuleName, SyncModuleError, unwrapSyncModuleError } from './services/synchronizer/SyncModuleRunner';
+import { runSyncModule, SyncModuleName, SyncModuleError, unwrapSyncModuleError } from './services/synchronizer/SyncModuleRunner';
 import handleConflictAction from './services/synchronizer/utils/handleConflictAction';
 import resourceRemotePath from './services/synchronizer/utils/resourceRemotePath';
 import syncDeleteStep from './services/synchronizer/utils/syncDeleteStep';
@@ -469,6 +471,8 @@ export default class Synchronizer {
 		let errorToThrow = null;
 		let syncLock = null;
 		let hasCaughtError = false;
+		let currentSyncStep = SyncModuleName.Initialization;
+		let currentSyncStep = SyncModuleName.Initialization;
 
 		try {
 			// Before synchronising make sure all share_id properties are set
@@ -588,20 +592,23 @@ export default class Synchronizer {
 			// ========================================================================
 
 			if (syncSteps.indexOf('delete_remote') >= 0) {
-				await syncDeleteStep(
-					syncTargetId,
-					() => {
-						return this.cancelling();
-					},
-					(action, local, logSyncOperation, message, actionCount) => {
-						this.logSyncOperation(action, local, logSyncOperation, message, actionCount);
-					},
-					(fnName, ...args) => {
-						return this.apiCall(fnName, ...args);
-					},
-					this.api(),
-					action => { return this.dispatch(action); },
-				);
+				currentSyncStep = SyncModuleName.DeleteRemote;
+				await runSyncModule(SyncModuleName.DeleteRemote, async () => {
+					await syncDeleteStep(
+						syncTargetId,
+						() => {
+							return this.cancelling();
+						},
+						(action, local, logSyncOperation, message, actionCount) => {
+							this.logSyncOperation(action, local, logSyncOperation, message, actionCount);
+						},
+						(fnName, ...args) => {
+							return this.apiCall(fnName, ...args);
+						},
+						this.api(),
+						action => { return this.dispatch(action); },
+					);
+				});
 			} // DELETE_REMOTE STEP
 
 			// ========================================================================
@@ -612,74 +619,76 @@ export default class Synchronizer {
 			// ========================================================================
 
 			if (syncSteps.indexOf('update_remote') >= 0) {
-				const donePaths: string[] = [];
+				currentSyncStep = SyncModuleName.UpdateRemote;
+				await runSyncModule(SyncModuleName.UpdateRemote, async () => {
+					const donePaths: string[] = [];
 
-				const completeItemProcessing = (path: string) => {
-					donePaths.push(path);
-				};
+					const completeItemProcessing = (path: string) => {
+						donePaths.push(path);
+					};
 
-				while (true) {
-					if (this.cancelling()) break;
-
-					const result = await BaseItem.itemsThatNeedSync(syncTargetId, 100, () => this.cancelling());
-					const locals = result.items;
-
-					await itemUploader.preUploadItems(result.items.filter(it => result.neverSyncedItemIds.includes(it.id)));
-
-					for (let i = 0; i < locals.length; i++) {
+					while (true) {
 						if (this.cancelling()) break;
 
-						let local = locals[i];
-						const ItemClass = BaseItem.itemClass(local);
-						const path = BaseItem.systemPath(local);
+						const result = await BaseItem.itemsThatNeedSync(syncTargetId, 100, () => this.cancelling());
+						const locals = result.items;
 
-						// Safety check to avoid infinite loops.
-						// - In fact this error is possible if the item is marked for sync (via sync_time or force_sync) while synchronisation is in
-						//   progress. When force_sync is not true, this is because the user is typing while the sync is running, so we should continue
-						//   looping, as we don't want the sync to stop when there are still un-synced outgoing changes, otherwise this creates a race condition
-						//   on mobile, where additional changes made during upload are not synced and don't trigger another sync, whereas a change made immediately
-						//   after the sync has finished will trigger another sync. Once the user has stopped typing, it can then break out of the loop and continue
-						//   the rest of the process.
-						// - It can also happen if the item is directly modified in the sync target, and set with an update_time in the future. In that case,
-						//   the local sync_time will be updated to Date.now() but on the next loop it will see that the remote item still has a date ahead
-						//   and will see a conflict. There's currently no automatic fix for this - the remote item on the sync target must be fixed manually
-						//   (by setting an updated_time less than current time).
-						if (donePaths.indexOf(path) >= 0) {
-							const syncItem = await BaseItem.syncItem(syncTargetId, local.id, { fields: ['force_sync'] });
-							if (local.updated_time > time.unixMs() + Day) {
-								throw new Error(sprintf('Remote item %s has an updated_time in the future', path));
-							} else if (local.updated_time > time.unixMs()) {
-								throw new JoplinError(sprintf('Processing a path that has already been done: %s. Remote item has an updated_time in the future', path), 'processingPathTwice');
-							} else if (syncItem.force_sync) {
-								throw new JoplinError(sprintf('Processing a path that has already been done: %s. Item was marked for sync using force_sync', path), 'processingPathTwice');
-							} else {
-								throw new JoplinError(sprintf('Processing a path that has already been done: %s. The user is making changes while the sync is in progress', path), 'changedDuringSync');
+						await itemUploader.preUploadItems(result.items.filter(it => result.neverSyncedItemIds.includes(it.id)));
+
+						for (let i = 0; i < locals.length; i++) {
+							if (this.cancelling()) break;
+
+							let local = locals[i];
+							const ItemClass = BaseItem.itemClass(local);
+							const path = BaseItem.systemPath(local);
+
+							// Safety check to avoid infinite loops.
+							// - In fact this error is possible if the item is marked for sync (via sync_time or force_sync) while synchronisation is in
+							//   progress. When force_sync is not true, this is because the user is typing while the sync is running, so we should continue
+							//   looping, as we don't want the sync to stop when there are still un-synced outgoing changes, otherwise this creates a race condition
+							//   on mobile, where additional changes made during upload are not synced and don't trigger another sync, whereas a change made immediately
+							//   after the sync has finished will trigger another sync. Once the user has stopped typing, it can then break out of the loop and continue
+							//   the rest of the process.
+							// - It can also happen if the item is directly modified in the sync target, and set with an update_time in the future. In that case,
+							//   the local sync_time will be updated to Date.now() but on the next loop it will see that the remote item still has a date ahead
+							//   and will see a conflict. There's currently no automatic fix for this - the remote item on the sync target must be fixed manually
+							//   (by setting an updated_time less than current time).
+							if (donePaths.indexOf(path) >= 0) {
+								const syncItem = await BaseItem.syncItem(syncTargetId, local.id, { fields: ['force_sync'] });
+								if (local.updated_time > time.unixMs() + Day) {
+									throw new Error(sprintf('Remote item %s has an updated_time in the future', path));
+								} else if (local.updated_time > time.unixMs()) {
+									throw new JoplinError(sprintf('Processing a path that has already been done: %s. Remote item has an updated_time in the future', path), 'processingPathTwice');
+								} else if (syncItem.force_sync) {
+									throw new JoplinError(sprintf('Processing a path that has already been done: %s. Item was marked for sync using force_sync', path), 'processingPathTwice');
+								} else {
+									throw new JoplinError(sprintf('Processing a path that has already been done: %s. The user is making changes while the sync is in progress', path), 'changedDuringSync');
+								}
 							}
-						}
 
-						const remote: RemoteItem = result.neverSyncedItemIds.includes(local.id) ? null : await this.apiCall('stat', path);
-						let action: SyncAction = null;
-						let itemIsReadOnly = false;
-						let reason = '';
-						let remoteContent = null;
+							const remote: RemoteItem = result.neverSyncedItemIds.includes(local.id) ? null : await this.apiCall('stat', path);
+							let action: SyncAction = null;
+							let itemIsReadOnly = false;
+							let reason = '';
+							let remoteContent = null;
 
-						const getConflictType = (conflictedItem: { type_?: number }) => {
-							if (conflictedItem.type_ === BaseModel.TYPE_NOTE) return SyncAction.NoteConflict;
-							if (conflictedItem.type_ === BaseModel.TYPE_RESOURCE) return SyncAction.ResourceConflict;
-							return SyncAction.ItemConflict;
-						};
+							const getConflictType = (conflictedItem: { type_?: number }) => {
+								if (conflictedItem.type_ === BaseModel.TYPE_NOTE) return SyncAction.NoteConflict;
+								if (conflictedItem.type_ === BaseModel.TYPE_RESOURCE) return SyncAction.ResourceConflict;
+								return SyncAction.ItemConflict;
+							};
 
-						if (!remote) {
-							if (!local.sync_time) {
-								action = SyncAction.CreateRemote;
-								reason = 'remote does not exist, and local is new and has never been synced';
-							} else {
+							if (!remote) {
+								if (!local.sync_time) {
+									action = SyncAction.CreateRemote;
+									reason = 'remote does not exist, and local is new and has never been synced';
+								} else {
 								// Note or item was modified after having been deleted remotely
 								// "itemConflict" is for all the items except the notes, which are dealt with in a special way
-								action = getConflictType(local);
-								reason = 'remote has been deleted, but local has changes';
-							}
-						} else {
+									action = getConflictType(local);
+									reason = 'remote has been deleted, but local has changes';
+								}
+							} else {
 							// Note: in order to know the real updated_time value, we need to load the content. In theory we could
 							// rely on the file timestamp (in remote.updated_time) but in practice it's not accurate enough and
 							// can lead to conflicts (for example when the file timestamp is slightly ahead of its real
@@ -694,51 +703,51 @@ export default class Synchronizer {
 							// could be done using the file timestamp and the potentially unnecessary content loading could be skipped.
 							// OneDrive does not appear to have accurate timestamps as lastModifiedDateTime would occasionally be
 							// a few seconds ahead of what it was set with setTimestamp()
-							try {
-								remoteContent = await this.apiCall('get', path);
-								if (!remoteContent) throw new Error(`Got metadata for path but could not fetch content: ${path}`);
-								remoteContent = await BaseItem.unserialize(remoteContent);
-							} catch (error) {
-								if (error.code === 'rejectedByTarget' || error.code === 'malformedItem') {
-									this.progressReport_.errors.push(error);
-									logger.warn(`Skipping item from sync target: ${path}: ${error.message}`);
-									completeItemProcessing(path);
-									continue;
-								} else {
-									throw error;
+								try {
+									remoteContent = await this.apiCall('get', path);
+									if (!remoteContent) throw new Error(`Got metadata for path but could not fetch content: ${path}`);
+									remoteContent = await BaseItem.unserialize(remoteContent);
+								} catch (error) {
+									if (error.code === 'rejectedByTarget' || error.code === 'malformedItem') {
+										this.progressReport_.errors.push(error);
+										logger.warn(`Skipping item from sync target: ${path}: ${error.message}`);
+										completeItemProcessing(path);
+										continue;
+									} else {
+										throw error;
+									}
 								}
-							}
 
-							if (remoteContent.updated_time > local.sync_time) {
+								if (remoteContent.updated_time > local.sync_time) {
 								// Since, in this loop, we are only dealing with items that require sync, if the
 								// remote has been modified after the sync time, it means both items have been
 								// modified and so there's a conflict.
-								action = getConflictType(local);
-								reason = 'both remote and local have changes';
-							} else {
-								action = SyncAction.UpdateRemote;
-								reason = 'local has changes';
+									action = getConflictType(local);
+									reason = 'both remote and local have changes';
+								} else {
+									action = SyncAction.UpdateRemote;
+									reason = 'local has changes';
+								}
 							}
-						}
 
-						if (action === SyncAction.NoteConflict && remote && (local as NoteEntity).is_conflict) {
-							if ((local as NoteEntity).updated_time > remoteContent.updated_time) {
-								action = SyncAction.UpdateRemote;
-								reason = 'conflict note has conflicting remote changes; local version is newer';
+							if (action === SyncAction.NoteConflict && remote && (local as NoteEntity).is_conflict) {
+								if ((local as NoteEntity).updated_time > remoteContent.updated_time) {
+									action = SyncAction.UpdateRemote;
+									reason = 'conflict note has conflicting remote changes; local version is newer';
+								}
 							}
-						}
 
-						// We no longer upload Master Keys however we keep them
-						// in the database for extra safety. In a future
-						// version, once it's confirmed that the new E2EE system
-						// works well, we can delete them.
-						if (local.type_ === ModelType.MasterKey) action = null;
+							// We no longer upload Master Keys however we keep them
+							// in the database for extra safety. In a future
+							// version, once it's confirmed that the new E2EE system
+							// works well, we can delete them.
+							if (local.type_ === ModelType.MasterKey) action = null;
 
-						this.logSyncOperation(action, local, remote, reason);
+							this.logSyncOperation(action, local, remote, reason);
 
-						if (local.type_ === BaseModel.TYPE_RESOURCE && (action === SyncAction.CreateRemote || action === SyncAction.UpdateRemote)) {
-							const localState = await Resource.localState(local.id);
-							if (localState.fetch_status !== Resource.FETCH_STATUS_DONE) {
+							if (local.type_ === BaseModel.TYPE_RESOURCE && (action === SyncAction.CreateRemote || action === SyncAction.UpdateRemote)) {
+								const localState = await Resource.localState(local.id);
+								if (localState.fetch_status !== Resource.FETCH_STATUS_DONE) {
 								// This condition normally shouldn't happen
 								// because the normal cases are as follow:
 								//
@@ -771,79 +780,79 @@ export default class Synchronizer {
 								// already been done" on the next loop, and sync
 								// will never finish because we'll always end up
 								// here.
-								logger.info(`Need to upload a resource, but blob is not present: ${path}`);
-								await handleCannotSyncItem(ItemClass, syncTargetId, local, 'Trying to upload resource, but only metadata is present.');
-								action = null;
-							} else {
+									logger.info(`Need to upload a resource, but blob is not present: ${path}`);
+									await handleCannotSyncItem(ItemClass, syncTargetId, local, 'Trying to upload resource, but only metadata is present.');
+									action = null;
+								} else {
+									try {
+										const remoteContentPath = resourceRemotePath(local.id);
+										const result = await Resource.fullPathForSyncUpload(local);
+										const resource = result.resource;
+										local = resource as typeof local;
+										const localResourceContentPath = result.path;
+
+										if (resource.size >= 10 * 1000 * 1000) {
+											logger.warn(`Uploading a large resource (resourceId: ${local.id}, size:${resource.size} bytes) which may tie up the sync process.`);
+										}
+
+										// We skip updating the blob if it hasn't
+										// been modified since the last sync. In
+										// that case, it means the resource metadata
+										// (title, filename, etc.) has been changed,
+										// but not the data blob.
+										const syncItem = await BaseItem.syncItem(syncTargetId, resource.id, { fields: ['sync_time', 'force_sync'] });
+										if (!syncItem || syncItem.sync_time < resource.blob_updated_time || syncItem.force_sync) {
+											await this.apiCall('put', remoteContentPath, null, { path: localResourceContentPath, source: 'file', shareId: resource.share_id });
+										}
+									} catch (error) {
+										if (isCannotSyncError(error)) {
+											await handleCannotSyncItem(ItemClass, syncTargetId, local, error.message);
+											action = null;
+										} else if (error && error.code === ErrorCode.IsReadOnly) {
+											action = getConflictType(local);
+											itemIsReadOnly = true;
+											logger.info('Resource is readonly and cannot be modified - handling it as a conflict:', local);
+										} else {
+											throw error;
+										}
+									}
+								}
+							}
+
+							if (action === SyncAction.CreateRemote || action === SyncAction.UpdateRemote) {
+								let canSync = true;
 								try {
-									const remoteContentPath = resourceRemotePath(local.id);
-									const result = await Resource.fullPathForSyncUpload(local);
-									const resource = result.resource;
-									local = resource as typeof local;
-									const localResourceContentPath = result.path;
-
-									if (resource.size >= 10 * 1000 * 1000) {
-										logger.warn(`Uploading a large resource (resourceId: ${local.id}, size:${resource.size} bytes) which may tie up the sync process.`);
-									}
-
-									// We skip updating the blob if it hasn't
-									// been modified since the last sync. In
-									// that case, it means the resource metadata
-									// (title, filename, etc.) has been changed,
-									// but not the data blob.
-									const syncItem = await BaseItem.syncItem(syncTargetId, resource.id, { fields: ['sync_time', 'force_sync'] });
-									if (!syncItem || syncItem.sync_time < resource.blob_updated_time || syncItem.force_sync) {
-										await this.apiCall('put', remoteContentPath, null, { path: localResourceContentPath, source: 'file', shareId: resource.share_id });
-									}
+									if (this.testingHooks_.indexOf('notesRejectedByTarget') >= 0 && local.type_ === BaseModel.TYPE_NOTE) throw new JoplinError('Testing rejectedByTarget', 'rejectedByTarget');
+									if (this.testingHooks_.indexOf('itemIsReadOnly') >= 0) throw new JoplinError('Testing isReadOnly', ErrorCode.IsReadOnly);
+									await itemUploader.serializeAndUploadItem(ItemClass, path, local);
 								} catch (error) {
-									if (isCannotSyncError(error)) {
+									if (error && error.code === 'rejectedByTarget') {
 										await handleCannotSyncItem(ItemClass, syncTargetId, local, error.message);
-										action = null;
+										canSync = false;
 									} else if (error && error.code === ErrorCode.IsReadOnly) {
 										action = getConflictType(local);
 										itemIsReadOnly = true;
-										logger.info('Resource is readonly and cannot be modified - handling it as a conflict:', local);
+										canSync = false;
 									} else {
 										throw error;
 									}
 								}
-							}
-						}
 
-						if (action === SyncAction.CreateRemote || action === SyncAction.UpdateRemote) {
-							let canSync = true;
-							try {
-								if (this.testingHooks_.indexOf('notesRejectedByTarget') >= 0 && local.type_ === BaseModel.TYPE_NOTE) throw new JoplinError('Testing rejectedByTarget', 'rejectedByTarget');
-								if (this.testingHooks_.indexOf('itemIsReadOnly') >= 0) throw new JoplinError('Testing isReadOnly', ErrorCode.IsReadOnly);
-								await itemUploader.serializeAndUploadItem(ItemClass, path, local);
-							} catch (error) {
-								if (error && error.code === 'rejectedByTarget') {
-									await handleCannotSyncItem(ItemClass, syncTargetId, local, error.message);
-									canSync = false;
-								} else if (error && error.code === ErrorCode.IsReadOnly) {
-									action = getConflictType(local);
-									itemIsReadOnly = true;
-									canSync = false;
-								} else {
-									throw error;
-								}
-							}
+								// Note: Currently, we set sync_time to update_time, which should work fine given that the resolution is the millisecond.
+								// In theory though, this could happen:
+								//
+								// 1. t0: Editor: Note is modified
+								// 2. t0: Sync: Found that note was modified so start uploading it
+								// 3. t0: Editor: Note is modified again
+								// 4. t1: Sync: Note has finished uploading, set sync_time to t0
+								//
+								// Later any attempt to sync will not detect that note was modified in (3) (within the same millisecond as it was being uploaded)
+								// because sync_time will be t0 too.
+								//
+								// The solution would be to use something like an etag (a simple counter incremented on every change) to make sure each
+								// change is uniquely identified. Leaving it like this for now.
 
-							// Note: Currently, we set sync_time to update_time, which should work fine given that the resolution is the millisecond.
-							// In theory though, this could happen:
-							//
-							// 1. t0: Editor: Note is modified
-							// 2. t0: Sync: Found that note was modified so start uploading it
-							// 3. t0: Editor: Note is modified again
-							// 4. t1: Sync: Note has finished uploading, set sync_time to t0
-							//
-							// Later any attempt to sync will not detect that note was modified in (3) (within the same millisecond as it was being uploaded)
-							// because sync_time will be t0 too.
-							//
-							// The solution would be to use something like an etag (a simple counter incremented on every change) to make sure each
-							// change is uniquely identified. Leaving it like this for now.
-
-							if (canSync) {
+								if (canSync) {
 								// 2018-01-21: Setting timestamp is not needed because the delta() logic doesn't rely
 								// on it (instead it uses a more reliable `context` object) and the itemsThatNeedSync loop
 								// above also doesn't use it because it fetches the whole remote object and read the
@@ -858,33 +867,34 @@ export default class Synchronizer {
 								// uploading. So we can leave it unspecified and then on the next run of the delta step, it will
 								// get set there
 
-								// A clean upload leaves no pending conflict, so the link is cleared too
-								const uploadedBase = local.type_ === BaseModel.TYPE_NOTE ? {
-									base_body: (local as NoteEntity).body ?? '',
-									base_title: (local as NoteEntity).title ?? '',
-									base_conflict_note_id: '',
-								} : null;
+									// A clean upload leaves no pending conflict, so the link is cleared too
+									const uploadedBase = local.type_ === BaseModel.TYPE_NOTE ? {
+										base_body: (local as NoteEntity).body ?? '',
+										base_title: (local as NoteEntity).title ?? '',
+										base_conflict_note_id: '',
+									} : null;
 
-								await ItemClass.saveSyncTime(syncTargetId, local, local.updated_time, 0, uploadedBase);
+									await ItemClass.saveSyncTime(syncTargetId, local, local.updated_time, 0, uploadedBase);
+								}
 							}
+
+							await handleConflictAction(
+								action,
+								ItemClass,
+								!!remote,
+								remoteContent,
+								local,
+								syncTargetId,
+								itemIsReadOnly,
+								action => this.dispatch(action),
+							);
+
+							completeItemProcessing(path);
 						}
 
-						await handleConflictAction(
-							action,
-							ItemClass,
-							!!remote,
-							remoteContent,
-							local,
-							syncTargetId,
-							itemIsReadOnly,
-							action => this.dispatch(action),
-						);
-
-						completeItemProcessing(path);
+						if (!result.hasMore) break;
 					}
-
-					if (!result.hasMore) break;
-				}
+				});
 			} // UPLOAD STEP
 
 			// ------------------------------------------------------------------------
@@ -898,213 +908,217 @@ export default class Synchronizer {
 			this.downloadQueue_ = new TaskQueue('syncDownload', logger);
 
 			if (syncSteps.indexOf('delta') >= 0) {
+				currentSyncStep = SyncModuleName.Delta;
+				await runSyncModule(SyncModuleName.Delta, async () => {
+				currentSyncStep = SyncModuleName.Delta;
+				await runSyncModule(SyncModuleName.Delta, async () => {
 				// At this point all the local items that have changed have been pushed to remote
 				// or handled as conflicts, so no conflict is possible after this.
 
-				let context = null;
-				let newDeltaContext = null;
-				const localFoldersToDelete = new Set<string>();
-				let hasCancelled = false;
-				if (lastContext.delta) context = lastContext.delta;
+					let context = null;
+					let newDeltaContext = null;
+					const localFoldersToDelete = new Set<string>();
+					let hasCancelled = false;
+					if (lastContext.delta) context = lastContext.delta;
 
-				while (true) {
-					if (this.cancelling() || hasCancelled) break;
+					while (true) {
+						if (this.cancelling() || hasCancelled) break;
 
-					let localItemMetadata: Map<string, RemoteItemMetadata> = null;
-					const listResult: PaginatedList = await this.apiCall('delta', '', {
-						context: context,
+						let localItemMetadata: Map<string, RemoteItemMetadata> = null;
+						const listResult: PaginatedList = await this.apiCall('delta', '', {
+							context: context,
 
-						// allItemIdsHandler() provides a way for drivers that don't have a delta API to
-						// still provide delta functionality by comparing the items they have to the items
-						// the client has. Very inefficient but that's the only possible workaround.
-						// It's a function so that it is only called if the driver needs these IDs. For
-						// drivers with a delta functionality it's a noop.
-						allItemIdsHandler: async () => {
-							return BaseItem.syncedItemIds(syncTargetId);
-						},
+							// allItemIdsHandler() provides a way for drivers that don't have a delta API to
+							// still provide delta functionality by comparing the items they have to the items
+							// the client has. Very inefficient but that's the only possible workaround.
+							// It's a function so that it is only called if the driver needs these IDs. For
+							// drivers with a delta functionality it's a noop.
+							allItemIdsHandler: async () => {
+								return BaseItem.syncedItemIds(syncTargetId);
+							},
 
-						// This is only used by the basic delta
-						allItemMetadataHandler: async () => {
-							localItemMetadata = await BaseItem.remoteItemMetadata(syncTargetId);
-							return localItemMetadata;
-						},
+							// This is only used by the basic delta
+							allItemMetadataHandler: async () => {
+								localItemMetadata = await BaseItem.remoteItemMetadata(syncTargetId);
+								return localItemMetadata;
+							},
 
-						wipeOutFailSafe: Setting.value('sync.wipeOutFailSafe'),
+							wipeOutFailSafe: Setting.value('sync.wipeOutFailSafe'),
 
-						logger: logger,
-					});
+							logger: logger,
+						});
 
-					// Ensure that if the sync target directory has changed, lost access, or has been purged by some external process while the sync is running, that a failsafe error is triggered where info.json and .sync/version.txt can no longer be found
-					// This check is more reliable than checking the count of items alone, as it is possible for sync items become segmented between 2 directories, possibly by the target directory changing during sync
-					// This scenario is possible with OneDrive sync, see https://github.com/laurent22/joplin/issues/11489
-					// This check while the sync is running is only necessary for the delta step of the sync, as this is where local deletions are calculated by comparing the local database and the sync target. These deletions are driven by the listResult field to determine which remote items exist
-					// As long as we check that info.json still exists after each time the listResult field is repopulated, there should not be a risk of unwanted deletions when failsafe is enabled, unless the target directory is directly manipulated by the user
-					await checkSyncTargetIsValid(this.api());
+						// Ensure that if the sync target directory has changed, lost access, or has been purged by some external process while the sync is running, that a failsafe error is triggered where info.json and .sync/version.txt can no longer be found
+						// This check is more reliable than checking the count of items alone, as it is possible for sync items become segmented between 2 directories, possibly by the target directory changing during sync
+						// This scenario is possible with OneDrive sync, see https://github.com/laurent22/joplin/issues/11489
+						// This check while the sync is running is only necessary for the delta step of the sync, as this is where local deletions are calculated by comparing the local database and the sync target. These deletions are driven by the listResult field to determine which remote items exist
+						// As long as we check that info.json still exists after each time the listResult field is repopulated, there should not be a risk of unwanted deletions when failsafe is enabled, unless the target directory is directly manipulated by the user
+						await checkSyncTargetIsValid(this.api());
 
-					const supportsDeltaWithItems = getSupportsDeltaWithItems(listResult);
+						const supportsDeltaWithItems = getSupportsDeltaWithItems(listResult);
 
-					logger.info('supportsDeltaWithItems = ', supportsDeltaWithItems);
+						logger.info('supportsDeltaWithItems = ', supportsDeltaWithItems);
 
-					const remotes = listResult.items;
+						const remotes = listResult.items;
 
-					this.logSyncOperation('fetchingTotal', null, null, 'Fetching delta items from sync target', remotes.length);
+						this.logSyncOperation('fetchingTotal', null, null, 'Fetching delta items from sync target', remotes.length);
 
-					const remoteIds = remotes.map(r => BaseItem.pathToId(r.path));
-					const locals = await BaseItem.loadItemsByIds(remoteIds);
+						const remoteIds = remotes.map(r => BaseItem.pathToId(r.path));
+						const locals = await BaseItem.loadItemsByIds(remoteIds);
 
-					for (const remote of remotes) {
-						if (this.cancelling()) break;
+						for (const remote of remotes) {
+							if (this.cancelling()) break;
 
-						let needsToDownload = true;
-						if (this.api().supportsAccurateTimestamp) {
-							const local = locals.find(l => l.id === BaseItem.pathToId(remote.path));
-							if (local && local.updated_time === remote.jop_updated_time) needsToDownload = false;
+							let needsToDownload = true;
+							if (this.api().supportsAccurateTimestamp) {
+								const local = locals.find(l => l.id === BaseItem.pathToId(remote.path));
+								if (local && local.updated_time === remote.jop_updated_time) needsToDownload = false;
+							}
+
+							if (supportsDeltaWithItems) {
+								needsToDownload = false;
+							}
+
+							if (needsToDownload) {
+								this.downloadQueue_.push(remote.path, async () => {
+									return this.apiCall('get', remote.path);
+								});
+							}
 						}
 
-						if (supportsDeltaWithItems) {
-							needsToDownload = false;
-						}
+						for (let i = 0; i < remotes.length; i++) {
+							if (this.cancelling() || this.testingHooks_.indexOf('cancelDeltaLoop2') >= 0) {
+								hasCancelled = true;
+								break;
+							}
 
-						if (needsToDownload) {
-							this.downloadQueue_.push(remote.path, async () => {
-								return this.apiCall('get', remote.path);
-							});
-						}
-					}
+							this.logSyncOperation('fetchingProcessed', null, null, 'Processing fetched item');
 
-					for (let i = 0; i < remotes.length; i++) {
-						if (this.cancelling() || this.testingHooks_.indexOf('cancelDeltaLoop2') >= 0) {
-							hasCancelled = true;
-							break;
-						}
+							const remote = remotes[i];
+							if (!BaseItem.isSystemPath(remote.path)) continue; // The delta API might return things like the .sync, .resource or the root folder
 
-						this.logSyncOperation('fetchingProcessed', null, null, 'Processing fetched item');
+							const loadContent = async () => {
+								if (supportsDeltaWithItems) return remote.jopItem;
 
-						const remote = remotes[i];
-						if (!BaseItem.isSystemPath(remote.path)) continue; // The delta API might return things like the .sync, .resource or the root folder
+								const task = await this.downloadQueue_.waitForResult(path);
+								if (task.error) throw task.error;
+								if (!task.result) return null;
+								return await BaseItem.unserialize(task.result as string);
+							};
 
-						const loadContent = async () => {
-							if (supportsDeltaWithItems) return remote.jopItem;
+							const path = remote.path;
+							const remoteId = BaseItem.pathToId(path);
+							let action: SyncAction = null;
+							let reason = '';
+							let local = locals.find(l => l.id === remoteId);
+							let ItemClass = null;
+							let content = null;
 
-							const task = await this.downloadQueue_.waitForResult(path);
-							if (task.error) throw task.error;
-							if (!task.result) return null;
-							return await BaseItem.unserialize(task.result as string);
-						};
-
-						const path = remote.path;
-						const remoteId = BaseItem.pathToId(path);
-						let action: SyncAction = null;
-						let reason = '';
-						let local = locals.find(l => l.id === remoteId);
-						let ItemClass = null;
-						let content = null;
-
-						try {
-							if (!local) {
-								if (remote.isDeleted !== true) {
-									action = SyncAction.CreateLocal;
-									reason = 'remote exists but local does not';
-									content = await loadContent();
-									ItemClass = content ? BaseItem.itemClass(content) : null;
-								} else {
-									reason = 'skipping: the item was deleted';
-								}
-							} else {
-								ItemClass = BaseItem.itemClass(local);
-								local = ItemClass.filter(local);
-								if (remote.isDeleted) {
-									action = SyncAction.DeleteLocal;
-									reason = 'remote has been deleted';
-								} else {
-									if (localFoldersToDelete.has(remoteId)) {
-										logger.debug('Removing a scheduled folder deletion (', remoteId, '). It was recreated by sync.');
-										localFoldersToDelete.delete(remoteId);
-									}
-
-									if (this.api().supportsAccurateTimestamp && remote.jop_updated_time === local.updated_time) {
-										// Nothing to do, and no need to fetch the content
-									} else {
+							try {
+								if (!local) {
+									if (remote.isDeleted !== true) {
+										action = SyncAction.CreateLocal;
+										reason = 'remote exists but local does not';
 										content = await loadContent();
-										// Load the latest updated_time, otherwise a change made during a long delta step could overwrite the local version without making a conflict
-										const latestLocalState = await ItemClass.load(remoteId, { fields: ['updated_time'] });
-										const localUpdatedTime = latestLocalState ? latestLocalState.updated_time : local.updated_time;
-										if (content && content.updated_time > localUpdatedTime) {
-											action = SyncAction.UpdateLocal;
-											reason = 'remote is more recent than local';
-										} else if (enableEnhancedBasicDeltaAlgorithm()) {
+										ItemClass = content ? BaseItem.itemClass(content) : null;
+									} else {
+										reason = 'skipping: the item was deleted';
+									}
+								} else {
+									ItemClass = BaseItem.itemClass(local);
+									local = ItemClass.filter(local);
+									if (remote.isDeleted) {
+										action = SyncAction.DeleteLocal;
+										reason = 'remote has been deleted';
+									} else {
+										if (localFoldersToDelete.has(remoteId)) {
+											logger.debug('Removing a scheduled folder deletion (', remoteId, '). It was recreated by sync.');
+											localFoldersToDelete.delete(remoteId);
+										}
+
+										if (this.api().supportsAccurateTimestamp && remote.jop_updated_time === local.updated_time) {
+										// Nothing to do, and no need to fetch the content
+										} else {
+											content = await loadContent();
+											// Load the latest updated_time, otherwise a change made during a long delta step could overwrite the local version without making a conflict
+											const latestLocalState = await ItemClass.load(remoteId, { fields: ['updated_time'] });
+											const localUpdatedTime = latestLocalState ? latestLocalState.updated_time : local.updated_time;
+											if (content && content.updated_time > localUpdatedTime) {
+												action = SyncAction.UpdateLocal;
+												reason = 'remote is more recent than local';
+											} else if (enableEnhancedBasicDeltaAlgorithm()) {
 											// When the enhanced basic delta algorithm is first used, all items are rescanned and we need to persist the remoteItemUpdatedTime
 											// to set up the initial synced state. This also catches the case if content.updated_time < local.updated_time due to manual manipulation
 											// of the md files, to prevent these items being continually fetched on every sync
-											const syncTime = localItemMetadata.get(local.id)?.sync_time ?? 0;
-											await ItemClass.saveSyncTime(syncTargetId, local, syncTime, remote.updated_time);
+												const syncTime = localItemMetadata.get(local.id)?.sync_time ?? 0;
+												await ItemClass.saveSyncTime(syncTargetId, local, syncTime, remote.updated_time);
+											}
 										}
 									}
 								}
+							} catch (error) {
+								if (error.code === 'rejectedByTarget' || error.code === 'malformedItem') {
+									this.progressReport_.errors.push(error);
+									logger.warn(`Skipping item from sync target: ${path}: ${error.message}`);
+									action = null;
+								} else {
+									error.message = `On file ${path}: ${error.message}`;
+									throw error;
+								}
 							}
-						} catch (error) {
-							if (error.code === 'rejectedByTarget' || error.code === 'malformedItem') {
-								this.progressReport_.errors.push(error);
-								logger.warn(`Skipping item from sync target: ${path}: ${error.message}`);
-								action = null;
-							} else {
-								error.message = `On file ${path}: ${error.message}`;
-								throw error;
-							}
-						}
 
-						if (this.testingHooks_.indexOf('skipRevisions') >= 0 && content && content.type_ === BaseModel.TYPE_REVISION) action = null;
+							if (this.testingHooks_.indexOf('skipRevisions') >= 0 && content && content.type_ === BaseModel.TYPE_REVISION) action = null;
 
-						if (!action) continue;
+							if (!action) continue;
 
-						this.logSyncOperation(action, local, remote, reason);
+							this.logSyncOperation(action, local, remote, reason);
 
-						if (action === SyncAction.CreateLocal || action === SyncAction.UpdateLocal) {
-							if (content === null) {
-								logger.warn(`Remote has been deleted between now and the delta() call? In that case it will be handled during the next sync: ${path}`);
-								continue;
-							}
-							content = ItemClass.filter(content);
-
-							// 2017-12-03: This was added because the new user_updated_time and user_created_time properties were added
-							// to the items. However changing the database is not enough since remote items that haven't been synced yet
-							// will not have these properties and, since they are required, it would cause a problem. So this check
-							// if they are present and, if not, set them to a reasonable default.
-							// Let's leave these two lines for 6 months, by which time all the clients should have been synced.
-							if (!content.user_updated_time) content.user_updated_time = content.updated_time;
-							if (!content.user_created_time) content.user_created_time = content.created_time;
-
-							// The downloaded version becomes the base, so both sides share an ancestor. An
-							// encrypted note carries no title or body, so the base is left empty until the
-							// decryption worker records it
-							const isNote = content.type_ === BaseModel.TYPE_NOTE;
-							const baseVersion = isNote ? {
-								base_body: (content as NoteEntity).body ?? '',
-								base_title: (content as NoteEntity).title ?? '',
-								base_conflict_note_id: '',
-							} : null;
-
-							// eslint-disable-next-line @typescript-eslint/no-explicit-any -- BaseItem.save options bag with route-specific keys (isNew, oldItem) added below
-							const options: any = {
-								autoTimestamp: false,
-								nextQueries: BaseItem.updateSyncTimeQueries(syncTargetId, content, BaseItem.remoteItemSyncTime(content.updated_time), baseVersion, remote.updated_time),
-								changeSource: ItemChange.SOURCE_SYNC,
-							};
-							if (action === SyncAction.CreateLocal) options.isNew = true;
-							if (action === SyncAction.UpdateLocal) options.oldItem = local;
-
-							const creatingOrUpdatingResource = content.type_ === BaseModel.TYPE_RESOURCE && (action === SyncAction.CreateLocal || action === SyncAction.UpdateLocal);
-
-							if (creatingOrUpdatingResource) {
-								if (content.size >= this.maxResourceSize()) {
-									await handleCannotSyncItem(ItemClass, syncTargetId, content, `File "${content.title}" is larger than allowed ${this.maxResourceSize()} bytes. Beyond this limit, the mobile app would crash.`, BaseItem.SYNC_ITEM_LOCATION_REMOTE);
+							if (action === SyncAction.CreateLocal || action === SyncAction.UpdateLocal) {
+								if (content === null) {
+									logger.warn(`Remote has been deleted between now and the delta() call? In that case it will be handled during the next sync: ${path}`);
 									continue;
 								}
+								content = ItemClass.filter(content);
 
-								await ResourceLocalState.save({ resource_id: content.id, fetch_status: Resource.FETCH_STATUS_IDLE });
-							}
+								// 2017-12-03: This was added because the new user_updated_time and user_created_time properties were added
+								// to the items. However changing the database is not enough since remote items that haven't been synced yet
+								// will not have these properties and, since they are required, it would cause a problem. So this check
+								// if they are present and, if not, set them to a reasonable default.
+								// Let's leave these two lines for 6 months, by which time all the clients should have been synced.
+								if (!content.user_updated_time) content.user_updated_time = content.updated_time;
+								if (!content.user_created_time) content.user_created_time = content.created_time;
 
-							if (content.type_ === ModelType.MasterKey) {
+								// The downloaded version becomes the base, so both sides share an ancestor. An
+								// encrypted note carries no title or body, so the base is left empty until the
+								// decryption worker records it
+								const isNote = content.type_ === BaseModel.TYPE_NOTE;
+								const baseVersion = isNote ? {
+									base_body: (content as NoteEntity).body ?? '',
+									base_title: (content as NoteEntity).title ?? '',
+									base_conflict_note_id: '',
+								} : null;
+
+								// eslint-disable-next-line @typescript-eslint/no-explicit-any -- BaseItem.save options bag with route-specific keys (isNew, oldItem) added below
+								const options: any = {
+									autoTimestamp: false,
+									nextQueries: BaseItem.updateSyncTimeQueries(syncTargetId, content, BaseItem.remoteItemSyncTime(content.updated_time), baseVersion, remote.updated_time),
+									changeSource: ItemChange.SOURCE_SYNC,
+								};
+								if (action === SyncAction.CreateLocal) options.isNew = true;
+								if (action === SyncAction.UpdateLocal) options.oldItem = local;
+
+								const creatingOrUpdatingResource = content.type_ === BaseModel.TYPE_RESOURCE && (action === SyncAction.CreateLocal || action === SyncAction.UpdateLocal);
+
+								if (creatingOrUpdatingResource) {
+									if (content.size >= this.maxResourceSize()) {
+										await handleCannotSyncItem(ItemClass, syncTargetId, content, `File "${content.title}" is larger than allowed ${this.maxResourceSize()} bytes. Beyond this limit, the mobile app would crash.`, BaseItem.SYNC_ITEM_LOCATION_REMOTE);
+										continue;
+									}
+
+									await ResourceLocalState.save({ resource_id: content.id, fetch_status: Resource.FETCH_STATUS_IDLE });
+								}
+
+								if (content.type_ === ModelType.MasterKey) {
 								// Special case for master keys - if we download
 								// one, we only add it to the store if it's not
 								// already there. That can happen for example if
@@ -1116,128 +1130,132 @@ export default class Synchronizer {
 								// If info.json already has the key we shouldn't
 								// update because the most up to date keys
 								// should always be in info.json now.
-								const existingMasterKey = await MasterKey.load(content.id);
-								if (!existingMasterKey) {
-									logger.info(`Downloaded a master key that was not in info.json - adding it to the store. ID: ${content.id}`);
-									await MasterKey.save(content);
-								}
-							} else {
-								const saved = await ItemClass.save(content, options);
+									const existingMasterKey = await MasterKey.load(content.id);
+									if (!existingMasterKey) {
+										logger.info(`Downloaded a master key that was not in info.json - adding it to the store. ID: ${content.id}`);
+										await MasterKey.save(content);
+									}
+								} else {
+									const saved = await ItemClass.save(content, options);
 
-								// Ensure that the item can be found if another create/update event is received for the same item:
-								if (!local) {
-									locals.push(saved);
-								}
+									// Ensure that the item can be found if another create/update event is received for the same item:
+									if (!local) {
+										locals.push(saved);
+									}
 
-								// Dispatched before the revision cleanup below: the reload marker is what
-								// makes queued editor saves stale, so it must advance before any await here.
-								if (action === SyncAction.UpdateLocal && content.type_ === BaseModel.TYPE_NOTE && content.id) {
+									// Dispatched before the revision cleanup below: the reload marker is what
+									// makes queued editor saves stale, so it must advance before any await here.
+									if (action === SyncAction.UpdateLocal && content.type_ === BaseModel.TYPE_NOTE && content.id) {
 									// Force the viewer / editor to reload on mobile, if a note is updated and it is currently open
-									this.dispatch({
-										type: 'EDITOR_NOTE_NEEDS_RELOAD',
-										noteId: content.id,
-									});
-								}
+										this.dispatch({
+											type: 'EDITOR_NOTE_NEEDS_RELOAD',
+											noteId: content.id,
+										});
+									}
 
-								if (isNoteLockEnabled() && content.type_ === BaseModel.TYPE_NOTE && NoteLockNote.isLocking(content, local)) {
+									if (isNoteLockEnabled() && content.type_ === BaseModel.TYPE_NOTE && NoteLockNote.isLocking(content, local)) {
 									// A note that was locked on another device may still have plaintext
 									// revisions locally, so clear them when the lock state arrives through sync.
-									try {
-										await RevisionService.instance().deleteUnencryptedHistoryForNote(content.id, { sourceDescription: 'Synchronizer: note lock' });
-									} catch (error) {
-										logger.warn(`Could not delete unencrypted revisions for locked note ${content.id}`, error);
+										try {
+											await RevisionService.instance().deleteUnencryptedHistoryForNote(content.id, { sourceDescription: 'Synchronizer: note lock' });
+										} catch (error) {
+											logger.warn(`Could not delete unencrypted revisions for locked note ${content.id}`, error);
+										}
 									}
 								}
+
+								if (creatingOrUpdatingResource) this.dispatch({ type: 'SYNC_CREATED_OR_UPDATED_RESOURCE', id: content.id });
+
+								// if (!hasAutoEnabledEncryption && content.type_ === BaseModel.TYPE_MASTER_KEY && !masterKeysBefore) {
+								// 	hasAutoEnabledEncryption = true;
+								// 	logger.info('One master key was downloaded and none was previously available: automatically enabling encryption');
+								// 	logger.info('Using master key: ', content.id);
+								// 	await this.encryptionService().enableEncryption(content);
+								// 	await this.encryptionService().loadMasterKeysFromSettings();
+								// 	logger.info('Encryption has been enabled with downloaded master key as active key. However, note that no password was initially supplied. It will need to be provided by user.');
+								// }
+
+								if (content.encryption_applied) this.dispatch({ type: 'SYNC_GOT_ENCRYPTED_ITEM' });
+							} else if (action === SyncAction.DeleteLocal) {
+								if (local.type_ === BaseModel.TYPE_FOLDER) {
+									localFoldersToDelete.add(local.id);
+									continue;
+								}
+
+								const ItemClass = BaseItem.itemClass(local.type_);
+								await ItemClass.delete(
+									local.id,
+									{
+										trackDeleted: false,
+										changeSource: ItemChange.SOURCE_SYNC,
+										sourceDescription: 'sync: deleteLocal',
+									},
+								);
+							}
+						}
+
+						// If user has cancelled, don't record the new context (2) so that synchronisation
+						// can start again from the previous context (1) next time. It is ok if some items
+						// have been synced between (1) and (2) because the loop above will handle the same
+						// items being synced twice as an update. If the local and remote items are identical
+						// the update will simply be skipped.
+						if (!hasCancelled) {
+							if (options.saveContextHandler) {
+								const deltaToSave = { ...listResult.context };
+								// Remove these two variables because they can be large and can be rebuilt
+								// the next time the sync is started.
+								delete deltaToSave.statsCache;
+								delete deltaToSave.statIdsCache;
+								options.saveContextHandler({ delta: deltaToSave });
 							}
 
-							if (creatingOrUpdatingResource) this.dispatch({ type: 'SYNC_CREATED_OR_UPDATED_RESOURCE', id: content.id });
+							if (!listResult.hasMore) {
+								newDeltaContext = listResult.context;
+								break;
+							}
+							context = listResult.context;
+						}
+					}
 
-							// if (!hasAutoEnabledEncryption && content.type_ === BaseModel.TYPE_MASTER_KEY && !masterKeysBefore) {
-							// 	hasAutoEnabledEncryption = true;
-							// 	logger.info('One master key was downloaded and none was previously available: automatically enabling encryption');
-							// 	logger.info('Using master key: ', content.id);
-							// 	await this.encryptionService().enableEncryption(content);
-							// 	await this.encryptionService().loadMasterKeysFromSettings();
-							// 	logger.info('Encryption has been enabled with downloaded master key as active key. However, note that no password was initially supplied. It will need to be provided by user.');
-							// }
+					outputContext.delta = newDeltaContext ? newDeltaContext : lastContext.delta;
 
-							if (content.encryption_applied) this.dispatch({ type: 'SYNC_GOT_ENCRYPTED_ITEM' });
-						} else if (action === SyncAction.DeleteLocal) {
-							if (local.type_ === BaseModel.TYPE_FOLDER) {
-								localFoldersToDelete.add(local.id);
-								continue;
+					// ------------------------------------------------------------------------
+					// Delete the folders that have been collected in the loop above.
+					// Folders are always deleted last, and only if they are empty.
+					// If they are not empty it's considered a conflict since whatever deleted
+					// them should have deleted their content too. In that case, all its notes
+					// are marked as "is_conflict".
+					// ------------------------------------------------------------------------
+
+					if (!this.cancelling()) {
+						for (const folderId of localFoldersToDelete) {
+							const noteIds = await Folder.noteIds(folderId);
+							if (noteIds.length) {
+								logger.warn('Conflict: Folder to be deleted', folderId, 'still contains notes', noteIds);
+								// CONFLICT
+								await Folder.markNotesAsConflict(folderId);
 							}
 
-							const ItemClass = BaseItem.itemClass(local.type_);
-							await ItemClass.delete(
-								local.id,
-								{
-									trackDeleted: false,
-									changeSource: ItemChange.SOURCE_SYNC,
-									sourceDescription: 'sync: deleteLocal',
-								},
-							);
+							const deletionOptions: DeleteOptions = {
+								deleteChildren: false,
+								trackDeleted: false,
+								changeSource: ItemChange.SOURCE_SYNC,
+								sourceDescription: 'Sync',
+							};
+							await Folder.delete(folderId, deletionOptions);
 						}
 					}
 
-					// If user has cancelled, don't record the new context (2) so that synchronisation
-					// can start again from the previous context (1) next time. It is ok if some items
-					// have been synced between (1) and (2) because the loop above will handle the same
-					// items being synced twice as an update. If the local and remote items are identical
-					// the update will simply be skipped.
-					if (!hasCancelled) {
-						if (options.saveContextHandler) {
-							const deltaToSave = { ...listResult.context };
-							// Remove these two variables because they can be large and can be rebuilt
-							// the next time the sync is started.
-							delete deltaToSave.statsCache;
-							delete deltaToSave.statIdsCache;
-							options.saveContextHandler({ delta: deltaToSave });
-						}
-
-						if (!listResult.hasMore) {
-							newDeltaContext = listResult.context;
-							break;
-						}
-						context = listResult.context;
+					if (!this.cancelling()) {
+						await BaseItem.deleteOrphanSyncItems();
 					}
-				}
-
-				outputContext.delta = newDeltaContext ? newDeltaContext : lastContext.delta;
-
-				// ------------------------------------------------------------------------
-				// Delete the folders that have been collected in the loop above.
-				// Folders are always deleted last, and only if they are empty.
-				// If they are not empty it's considered a conflict since whatever deleted
-				// them should have deleted their content too. In that case, all its notes
-				// are marked as "is_conflict".
-				// ------------------------------------------------------------------------
-
-				if (!this.cancelling()) {
-					for (const folderId of localFoldersToDelete) {
-						const noteIds = await Folder.noteIds(folderId);
-						if (noteIds.length) {
-							logger.warn('Conflict: Folder to be deleted', folderId, 'still contains notes', noteIds);
-							// CONFLICT
-							await Folder.markNotesAsConflict(folderId);
-						}
-
-						const deletionOptions: DeleteOptions = {
-							deleteChildren: false,
-							trackDeleted: false,
-							changeSource: ItemChange.SOURCE_SYNC,
-							sourceDescription: 'Sync',
-						};
-						await Folder.delete(folderId, deletionOptions);
-					}
-				}
-
-				if (!this.cancelling()) {
-					await BaseItem.deleteOrphanSyncItems();
-				}
+				});
 			} // DELTA STEP
-		} catch (error) {
+		} catch (moduleFailure) {
+			const error = unwrapSyncModuleError(moduleFailure) as Error & { code?: string; details?: unknown };
 			hasCaughtError = true;
+			const failedModule = moduleFailure instanceof SyncModuleError ? moduleFailure.moduleName : currentSyncStep;
+			logger.error(`Synchronizer module "${failedModule}" failed:`, error);
 
 			if (error.code === ErrorCode.MustUpgradeApp) {
 				this.dispatch({
